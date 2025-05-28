@@ -1,7 +1,7 @@
 (visprog) sanideshmukh@Sanis-MacBook-Pro-242 visprog_new % python compare_images.py
-📡 Getting questions from GPT-4o Vision...
+Getting questions from GPT-4o Vision...
 
-🧾 Raw GPT Response:
+Raw GPT Response:
 ```json
 [
     "Is there a spoon visible on the table?",
