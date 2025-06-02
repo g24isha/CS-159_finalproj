@@ -17,25 +17,64 @@ from diffusers import StableDiffusionInpaintPipeline
 
 from .nms import nms
 from vis_utils import html_embed_image, html_colored_span, vis_masks
+import ast
 
+def parse_step(step_str, partial=False):
+    import ast
 
-def parse_step(step_str,partial=False):
-    tokens = list(tokenize.generate_tokens(io.StringIO(step_str).readline))
-    output_var = tokens[0].string
-    step_name = tokens[2].string
-    parsed_result = dict(
-        output_var=output_var,
-        step_name=step_name)
-    if partial:
-        return parsed_result
+    def smart_escape_quotes(s):
+        lines = s.split("\n")
+        new_lines = []
+        for line in lines:
+            if '"' in line:
+                quote_parts = line.split('"')
+                for i in range(1, len(quote_parts), 2):
+                    quote_parts[i] = quote_parts[i].replace("'", "\\'")
+                line = '"'.join(quote_parts)
+            new_lines.append(line)
+        return "\n".join(new_lines)
 
-    arg_tokens = [token for token in tokens[4:-3] if token.string not in [',','=']]
-    num_tokens = len(arg_tokens) // 2
-    args = dict()
-    for i in range(num_tokens):
-        args[arg_tokens[2*i].string] = arg_tokens[2*i+1].string
-    parsed_result['args'] = args
-    return parsed_result
+    step_str = smart_escape_quotes(step_str)
+
+    try:
+        tree = ast.parse(step_str, mode="exec")
+    except SyntaxError as e:
+        raise ValueError(f"Failed to parse step string due to syntax error: {e}\n\nLine: {step_str}")
+
+    assign = tree.body[0]
+    if not isinstance(assign, ast.Assign) or not isinstance(assign.value, ast.Call):
+        raise ValueError("Invalid step format")
+
+    output_var = assign.targets[0].id
+    step_name = assign.value.func.id
+
+    args = {}
+    for kw in assign.value.keywords:
+        if isinstance(kw.value, ast.Constant):  # Python 3.8+
+            args[kw.arg] = kw.value.value
+        elif isinstance(kw.value, ast.Str):     # Python <3.8
+            args[kw.arg] = kw.value.s
+        elif isinstance(kw.value, ast.Name):
+            args[kw.arg] = kw.value.id
+        elif isinstance(kw.value, ast.Call) and kw.value.func.id == 'str':
+            # Handles things like str("object")
+            args[kw.arg] = kw.value.args[0].s
+        else:
+            try:
+                val = ast.literal_eval(kw.value)
+                args[kw.arg] = val
+            except Exception:
+                args[kw.arg] = ast.unparse(kw.value)
+
+    result = {
+        "output_var": output_var,
+        "step_name": step_name,
+        "args": args
+    }
+
+    # print("Parsed Step:", result)  # helpful debug
+
+    return result if not partial else {"output_var": output_var, "step_name": step_name}
 
 
 def html_step_name(content):
@@ -56,6 +95,9 @@ def html_var_name(content):
 def html_arg_name(content):
     arg_name = html_colored_span(content, 'darkorange')
     return f'<b>{arg_name}</b>'
+
+def html_colored_span(content, color):
+    return f'<span style="color: {color}">{content}</span>'
 
     
 class EvalInterpreter():
@@ -106,45 +148,54 @@ class EvalInterpreter():
             html_str = self.html(eval_expression, step_input, step_output, output_var)
             return step_output, html_str
 
-        return step_output
-
-
+        return step_output, None
+    
 class ResultInterpreter():
     step_name = 'RESULT'
-
+    
     def __init__(self):
         print(f'Registering {self.step_name} step')
-
-    def parse(self,prog_step):
+    
+    def parse(self, prog_step):
         parse_result = parse_step(prog_step.prog_str)
         step_name = parse_result['step_name']
-        output_var = parse_result['args']['var']
-        assert(step_name==self.step_name)
-        return output_var
-
-    def html(self,output,output_var):
-        step_name = html_step_name(self.step_name)
-        output_var = html_var_name(output_var)
-        if isinstance(output, Image.Image):
-            output = html_embed_image(output,300)
-        else:
-            output = html_output(output)
-            
-        return f"""<div>{step_name} -> {output_var} -> {output}</div>"""
-
-    def execute(self,prog_step,inspect=False):
-        output_var = self.parse(prog_step)
-        output = prog_step.state[output_var]
+        var_name = parse_result['args']['var']
+        output_var = parse_result['output_var']
+        assert step_name == self.step_name
+        return var_name, output_var
+    
+    def execute(self, prog_step, inspect=False):
+        var_name, output_var = self.parse(prog_step)
+        
+        if var_name not in prog_step.state:
+            raise KeyError(f"[RESULT] Variable '{var_name}' not found in state")
+        
+        result_value = prog_step.state[var_name]
+        
+        if result_value is None:
+            raise ValueError(f"[RESULT] Variable '{var_name}' contains None value")
+        
+        prog_step.state[output_var] = result_value
+        
         if inspect:
-            html_str = self.html(output,output_var)
-            return output, html_str
+            html_str = self.html(var_name, output_var, result_value)
+            return result_value, html_str
+        else:
+            return result_value, None
+    
+    def html(self, var_name, output_var, result_value):
+        step_name = html_step_name(self.step_name)
+        var_name = html_var_name(var_name)
+        output_var = html_var_name(output_var)
+        var_arg = html_arg_name("var")
+        output = html_output(result_value)
+        return f"""{output_var}={step_name}({var_arg}={var_name})={output}"""
 
-        return output
 
 
 class VQAInterpreter():
     step_name = 'VQA'
-
+    
     def __init__(self):
         print(f'Registering {self.step_name} step')
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -152,26 +203,26 @@ class VQAInterpreter():
         self.model = BlipForQuestionAnswering.from_pretrained(
             "Salesforce/blip-vqa-capfilt-large").to(self.device)
         self.model.eval()
-
-    def parse(self,prog_step):
+    
+    def parse(self, prog_step):
         parse_result = parse_step(prog_step.prog_str)
         step_name = parse_result['step_name']
         args = parse_result['args']
-        img_var = args['image']
-        question = eval(args['question'])
         output_var = parse_result['output_var']
-        assert(step_name==self.step_name)
-        return img_var,question,output_var
-
-    def predict(self,img,question):
-        encoding = self.processor(img,question,return_tensors='pt')
-        encoding = {k:v.to(self.device) for k,v in encoding.items()}
+        img_var = args['image']
+        question = args['question'].strip('"\'')
+        assert step_name == self.step_name
+        return img_var, question, output_var
+    
+    def predict(self, img, question):
+        encoding = self.processor(img, question, return_tensors='pt')
+        encoding = {k: v.to(self.device) for k, v in encoding.items()}
         with torch.no_grad():
             outputs = self.model.generate(**encoding)
         
         return self.processor.decode(outputs[0], skip_special_tokens=True)
-
-    def html(self,img,question,answer,output_var):
+    
+    def html(self, img, question, answer, output_var):
         step_name = html_step_name(self.step_name)
         img_str = html_embed_image(img)
         answer = html_output(answer)
@@ -179,17 +230,80 @@ class VQAInterpreter():
         image_arg = html_arg_name('image')
         question_arg = html_arg_name('question')
         return f"""<div>{output_var}={step_name}({image_arg}={img_str},&nbsp;{question_arg}='{question}')={answer}</div>"""
-
-    def execute(self,prog_step,inspect=False):
-        img_var,question,output_var = self.parse(prog_step)
-        img = prog_step.state[img_var]
-        answer = self.predict(img,question)
+    
+    def execute(self, prog_step, inspect=False):
+        img_var, question, output_var = self.parse(prog_step)
+        
+        # CRITICAL FIX: Resolve the image variable first
+        # Check if img_var is a variable name in the program state
+        if isinstance(img_var, str) and img_var in prog_step.state:
+            image_or_regions = prog_step.state[img_var]
+        else:
+            image_or_regions = img_var
+        
+        # Handle region lists from FIND operations
+        if isinstance(image_or_regions, list):  # region list from FIND
+            if not image_or_regions:
+                raise ValueError("VQA received an empty region list.")
+            region = image_or_regions[0]
+            
+            # Get base image from state
+            base_image = prog_step.state.get("LEFT", None)
+            if base_image is None:
+                raise ValueError("No base image found in program state.")
+            
+            # If base_image is still a string, convert it to PIL Image
+            if isinstance(base_image, str):
+                try:
+                    base_image = Image.open(base_image).convert('RGB')
+                    # Update the state with the loaded image
+                    prog_step.state["LEFT"] = base_image
+                except Exception as e:
+                    raise ValueError(f"Could not load image from path '{base_image}': {e}")
+            
+            # Crop the region
+            if isinstance(region, dict) and "box" in region:
+                x1, y1, x2, y2 = region["box"]
+                image_or_regions = base_image.crop((x1, y1, x2, y2))
+            else:
+                raise ValueError(f"Invalid region format: {region}")
+        
+        # Handle direct image references (not from FIND)
+        elif isinstance(image_or_regions, str):
+            # Try to get from state first
+            if image_or_regions in prog_step.state:
+                image_obj = prog_step.state[image_or_regions]
+                if isinstance(image_obj, str):
+                    # It's a file path, load it
+                    try:
+                        image_or_regions = Image.open(image_obj).convert('RGB')
+                        # Update state with loaded image
+                        prog_step.state[img_var] = image_or_regions
+                    except Exception as e:
+                        raise ValueError(f"Could not load image from path '{image_obj}': {e}")
+                else:
+                    image_or_regions = image_obj
+            else:
+                # Assume it's a file path
+                try:
+                    image_or_regions = Image.open(image_or_regions).convert('RGB')
+                except Exception as e:
+                    raise ValueError(f"Could not load image from path '{img_var}': {e}")
+        
+        # Final check: ensure we have a PIL Image
+        if not isinstance(image_or_regions, Image.Image):
+            raise ValueError(f"Final image is not a PIL Image. Got: {type(image_or_regions)}")
+        
+        # Now we can safely call predict
+        answer = self.predict(image_or_regions, question)
         prog_step.state[output_var] = answer
-        if inspect:
-            html_str = self.html(img, question, answer, output_var)
-            return answer, html_str
 
-        return answer
+        if inspect:
+            html_str = self.html(image_or_regions, question, answer, output_var)
+            return answer, html_str
+        return answer, None
+
+
 
 
 class LocInterpreter():
@@ -317,7 +431,7 @@ class LocInterpreter():
             html_str = self.html(img, box_img, output_var, obj_name)
             return bboxes, html_str
 
-        return bboxes
+        return bboxes, None
 
 
 class Loc2Interpreter(LocInterpreter):
@@ -340,7 +454,7 @@ class Loc2Interpreter(LocInterpreter):
             html_str = self.html(img, box_img, output_var, obj_name)
             return bboxes, html_str
 
-        return objs
+        return objs, None
 
 
 class CountInterpreter():
@@ -349,33 +463,38 @@ class CountInterpreter():
     def __init__(self):
         print(f'Registering {self.step_name} step')
 
-    def parse(self,prog_step):
+    def parse(self, prog_step):
         parse_result = parse_step(prog_step.prog_str)
         step_name = parse_result['step_name']
-        box_var = parse_result['args']['box']
+        region_var = parse_result['args']['region']
         output_var = parse_result['output_var']
-        assert(step_name==self.step_name)
-        return box_var,output_var
+        assert step_name == self.step_name
+        return region_var, output_var
 
-    def html(self,box_img,output_var,count):
+    def html(self, region_var, output_var, count):
         step_name = html_step_name(self.step_name)
         output_var = html_var_name(output_var)
-        box_arg = html_arg_name('bbox')
-        box_img = html_embed_image(box_img)
+        region_arg = html_arg_name('region')
         output = html_output(count)
-        return f"""<div>{output_var}={step_name}({box_arg}={box_img})={output}</div>"""
+        return f"""<div>{output_var}={step_name}({region_arg}={region_var})={output}</div>"""
 
-    def execute(self,prog_step,inspect=False):
-        box_var,output_var = self.parse(prog_step)
-        boxes = prog_step.state[box_var]
-        count = len(boxes)
+    def execute(self, prog_step, inspect=False):
+        region_var, output_var = self.parse(prog_step)
+        regions = prog_step.state[region_var]
+
+        if isinstance(regions, (int, float)):
+            count = int(regions)
+        elif isinstance(regions, list):
+            count = len([r for r in regions if 'box' in r])
+        else:
+            count = 0
+
         prog_step.state[output_var] = count
         if inspect:
-            box_img = prog_step.state[box_var+'_IMAGE']
-            html_str = self.html(box_img, output_var, count)
+            html_str = self.html(region_var, output_var, count)
             return count, html_str
+        return count, None
 
-        return count
 
 
 class CropInterpreter():
@@ -433,7 +552,7 @@ class CropInterpreter():
             html_str = self.html(img, out_img, output_var, box_img)
             return out_img, html_str
 
-        return out_img
+        return out_img, None
 
 
 class CropRightOfInterpreter(CropInterpreter):
@@ -465,7 +584,7 @@ class CropRightOfInterpreter(CropInterpreter):
             html_str = self.html(img, out_img, output_var, box_img)
             return out_img, html_str
 
-        return out_img
+        return out_img, None
 
 
 class CropLeftOfInterpreter(CropInterpreter):
@@ -497,7 +616,7 @@ class CropLeftOfInterpreter(CropInterpreter):
             html_str = self.html(img, out_img, output_var, box_img)
             return out_img, html_str
 
-        return out_img
+        return out_img, None
 
 
 class CropAboveInterpreter(CropInterpreter):
@@ -529,7 +648,7 @@ class CropAboveInterpreter(CropInterpreter):
             html_str = self.html(img, out_img, output_var, box_img)
             return out_img, html_str
 
-        return out_img
+        return out_img, None
 
 class CropBelowInterpreter(CropInterpreter):
     step_name = 'CROP_BELOW'
@@ -560,7 +679,7 @@ class CropBelowInterpreter(CropInterpreter):
             html_str = self.html(img, out_img, output_var, box_img)
             return out_img, html_str
 
-        return out_img
+        return out_img, None
 
 class CropFrontOfInterpreter(CropInterpreter):
     step_name = 'CROP_FRONTOF'
@@ -648,7 +767,7 @@ class SegmentInterpreter():
             html_str = self.html(img_var, output_var, obj_img)
             return objs, html_str
 
-        return objs
+        return objs, None
 
 
 class SelectInterpreter():
@@ -743,7 +862,7 @@ class SelectInterpreter():
             html_str = self.html(img_var, obj_var, query, category, output_var, select_obj_img)
             return select_objs, html_str
 
-        return select_objs
+        return select_objs, None
 
 
 class ColorpopInterpreter():
@@ -804,7 +923,7 @@ class ColorpopInterpreter():
             html_str = self.html(img_var, obj_var, output_var, gimg)
             return gimg, html_str
 
-        return gimg
+        return gimg, None
 
 
 class BgBlurInterpreter():
@@ -871,7 +990,7 @@ class BgBlurInterpreter():
             html_str = self.html(img_var, obj_var, output_var, bgimg)
             return bgimg, html_str
 
-        return bgimg
+        return bgimg, None
 
 
 class FaceDetInterpreter():
@@ -946,7 +1065,7 @@ class FaceDetInterpreter():
             html_str = self.html(img, output_var, objs)
             return objs, html_str
 
-        return objs
+        return objs, None
 
 
 class EmojiInterpreter():
@@ -1006,7 +1125,7 @@ class EmojiInterpreter():
             html_str = self.html(img_var, obj_var, emoji_name, output_var, img)
             return img, html_str
 
-        return img
+        return img, None
 
 
 class ListInterpreter():
@@ -1070,7 +1189,7 @@ List:"""
             html_str = self.html(text, list_max, item_list, output_var)
             return item_list, html_str
 
-        return item_list
+        return item_list, None
 
 
 class ClassifyInterpreter():
@@ -1185,7 +1304,7 @@ class ClassifyInterpreter():
             html_str = self.html(image_var,obj_var,objs,category_var,output_var)
             return objs, html_str
 
-        return objs
+        return objs, None
 
 
 class TagInterpreter():
@@ -1243,7 +1362,7 @@ class TagInterpreter():
             html_str = self.html(img_var, img, obj_var, output_var)
             return img, html_str
 
-        return img
+        return img, None
 
 
 def dummy(images, **kwargs):
@@ -1330,7 +1449,247 @@ class ReplaceInterpreter():
         if inspect:
             html_str = self.html(img_var, obj_var, prompt, output_var, new_img)
             return new_img, html_str
-        return new_img
+        return new_img, None
+
+class FindInterpreter():
+    step_name = 'FIND'
+    
+    def __init__(self):
+        print(f'Registering {self.step_name} step')
+        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        from transformers import OwlViTProcessor, OwlViTForObjectDetection
+        self.processor = OwlViTProcessor.from_pretrained("google/owlvit-large-patch14")
+        self.model = OwlViTForObjectDetection.from_pretrained("google/owlvit-large-patch14").to(self.device)
+        self.model.eval()
+    
+    def parse(self, prog_step):
+        parse_result = parse_step(prog_step.prog_str)
+        step_name = parse_result['step_name']
+        image_var = parse_result['args']['image']
+        object_query = parse_result['args']['object']
+        output_var = parse_result['output_var']
+        assert step_name == self.step_name
+        return image_var, object_query, output_var
+    
+    def execute(self, prog_step, inspect=False):
+        image_var, object_query, output_var = self.parse(prog_step)
+        
+        if image_var not in prog_step.state:
+            raise KeyError(f"[FIND] Image variable '{image_var}' not found in state")
+        
+        image_or_regions = prog_step.state[image_var]
+        
+        # Handle case where input is a list of regions from previous FIND
+        if isinstance(image_or_regions, list):
+            if not image_or_regions:
+                raise ValueError(f"[FIND] Received empty region list from variable '{image_var}'")
+            
+            # Get the base image to crop regions from
+            base_image = self._get_base_image(prog_step)
+            
+            # Find objects within each region and combine results
+            all_detections = []
+            for region in image_or_regions:
+                if not isinstance(region, dict) or 'box' not in region:
+                    raise ValueError(f"[FIND] Invalid region format: {region}")
+                
+                # Crop the region from base image
+                x1, y1, x2, y2 = region['box']
+                cropped_image = base_image.crop((x1, y1, x2, y2))
+                
+                # Find objects in this cropped region
+                region_detections = self.find(cropped_image, object_query)
+                
+                # Adjust coordinates back to original image space
+                for detection in region_detections:
+                    orig_box = detection['box']
+                    # Add the region offset to get coordinates in original image
+                    detection['box'] = [
+                        orig_box[0] + x1,
+                        orig_box[1] + y1, 
+                        orig_box[2] + x1,
+                        orig_box[3] + y1
+                    ]
+                
+                all_detections.extend(region_detections)
+            
+            detections = all_detections
+        
+        # Handle case where input is a direct image
+        else:
+            # Handle string paths or direct PIL images
+            if isinstance(image_or_regions, str):
+                try:
+                    from PIL import Image
+                    image_or_regions = Image.open(image_or_regions).convert('RGB')
+                    # Update state with loaded image
+                    prog_step.state[image_var] = image_or_regions
+                except Exception as e:
+                    raise ValueError(f"[FIND] Could not load image from path '{image_or_regions}': {e}")
+            
+            if not hasattr(image_or_regions, 'size'):
+                raise ValueError(f"[FIND] Invalid image type: {type(image_or_regions)}")
+                
+            detections = self.find(image_or_regions, object_query)
+        
+        prog_step.state[output_var] = detections
+        
+        if inspect:
+            html_str = self.html(image_var, object_query, output_var, detections)
+            return detections, html_str
+        return detections, None
+    
+    def _get_base_image(self, prog_step):
+        """Get the base image for coordinate transformations"""
+        # Try common image variable names
+        for img_var in ['LEFT', 'RIGHT', 'IMAGE']:
+            if img_var in prog_step.state:
+                base_img = prog_step.state[img_var]
+                if isinstance(base_img, str):
+                    from PIL import Image
+                    base_img = Image.open(base_img).convert('RGB')
+                    prog_step.state[img_var] = base_img
+                return base_img
+        
+        raise ValueError("[FIND] No base image found in program state for coordinate transformation")
+    
+    def find(self, image, object_query):
+        if isinstance(object_query, str):
+            object_query = [object_query]
+        
+        inputs = self.processor(images=image, text=object_query, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        
+        target_sizes = torch.Tensor([image.size[::-1]]).to(self.device)
+        results = self.processor.post_process_object_detection(outputs, threshold=0.1, target_sizes=target_sizes)[0]
+        
+        detections = []
+        for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+            box = [int(x) for x in box.tolist()]  # Convert to integers
+            detections.append({
+                'box': box,
+                'category': object_query[label.item()],
+                'score': score.item()
+            })
+        return detections
+    
+    def html(self, image_var, object_query, output_var, output):
+        step_name = html_step_name(self.step_name)
+        image_var = html_var_name(image_var)
+        object_query = html_var_name(object_query)
+        output_var = html_var_name(output_var)
+        image_arg = html_arg_name('image')
+        object_arg = html_arg_name('object')
+        output = html_output(output)
+        return f"""{output_var}={step_name}({image_arg}={image_var},{object_arg}={object_query})={output}"""
+    
+
+class FilterInterpreter():
+    step_name = 'FILTER'
+
+    def __init__(self):
+        print(f'Registering {self.step_name} step')
+        from engine.blip_vqa import BlipVQA  # assuming you have BLIP module set up
+        self.vqa = BlipVQA()
+
+    def parse(self, prog_step):
+        parse_result = parse_step(prog_step.prog_str)
+        step_name = parse_result['step_name']
+        region_var = parse_result['args']['region']  # ← Changed from 'image'
+        attribute = parse_result['args']['attribute']  # ← Changed from 'object'
+        output_var = parse_result['output_var']
+        assert step_name == self.step_name
+        return region_var, attribute, output_var  # ← Now returns correct values
+
+    def execute(self, prog_step, inspect=False):
+        region_var, attribute, output_var = self.parse(prog_step)
+        
+        # Check if region_var exists in state
+        if region_var not in prog_step.state:
+            raise KeyError(f"[FILTER] Region variable '{region_var}' not found in state")
+            
+        regions = prog_step.state[region_var]
+        
+        # Get the image - you might need to determine which image to use
+        # For now, assuming LEFT image, but you may need to make this more flexible
+        image = prog_step.state["LEFT"]  
+
+        filtered = self.filter_regions(image, regions, attribute)
+        prog_step.state[output_var] = filtered
+        
+        if inspect:
+            html_str = self.html(region_var, attribute, output_var, filtered)
+            return filtered, html_str
+        return filtered, None
+
+    def filter_regions(self, image, regions, attribute):
+        if not isinstance(regions, list):
+            return []
+
+        kept = []
+        for region in regions:
+            box = region.get("box")
+            if not box:
+                continue
+            x1, y1, x2, y2 = map(int, box)
+            cropped = image.crop((x1, y1, x2, y2))
+
+            question = f"Is this object {attribute}?"
+            answer = self.vqa.ask(image=cropped, question=question)
+            if self.attribute_matches(attribute, answer):
+                kept.append(region)
+        return kept
+
+    def attribute_matches(self, attribute, answer):
+        return attribute.lower().strip() in str(answer).lower().strip()
+
+    def html(self, region_var, attribute, output_var, output):
+        step_name = html_step_name(self.step_name)
+        region_var = html_var_name(region_var)
+        output_var = html_var_name(output_var)
+        attr_arg = html_arg_name("attribute")
+        region_arg = html_arg_name("region")
+        output_str = html_output(output)
+        return f"""{output_var}={step_name}({region_arg}={region_var},{attr_arg}="{attribute}")={output_str}"""
+
+class ExistsInterpreter():
+    step_name = 'EXISTS'
+
+    def __init__(self):
+        print(f'Registering {self.step_name} step')
+
+    def parse(self, prog_step):
+        parse_result = parse_step(prog_step.prog_str)
+        step_name = parse_result['step_name']
+        region_var = parse_result['args']['region']
+        output_var = parse_result['output_var']
+        assert step_name == self.step_name
+        return region_var, output_var
+
+    def execute(self, prog_step, inspect=False):
+        region_var, output_var = self.parse(prog_step)
+        regions = prog_step.state[region_var]
+        if isinstance(regions, list):
+            output = len([r for r in regions if isinstance(r, dict) and 'box' in r]) > 0
+        elif isinstance(regions, (int, float)):
+            output = regions > 0
+        else:
+            output = False
+        prog_step.state[output_var] = output
+        if inspect:
+            html_str = self.html(region_var, output_var, output)
+            return output, html_str
+        return output, None
+
+    def html(self, region_var, output_var, output):
+        step_name = html_step_name(self.step_name)
+        region_var = html_var_name(region_var)
+        output_var = html_var_name(output_var)
+        region_arg = html_arg_name("region")
+        output = html_output(output)
+        return f"""{output_var}={step_name}({region_arg}={region_var})={output}"""
+
 
 
 def register_step_interpreters(dataset='nlvr'):
@@ -1338,7 +1697,12 @@ def register_step_interpreters(dataset='nlvr'):
         return dict(
             VQA=VQAInterpreter(),
             EVAL=EvalInterpreter(),
-            RESULT=ResultInterpreter()
+            RESULT=ResultInterpreter(),
+            FIND=FindInterpreter(),
+            COUNT=CountInterpreter(),
+            FILTER=FilterInterpreter(),
+            EXISTS=ExistsInterpreter()
+            
         )
     elif dataset=='gqa':
         return dict(
